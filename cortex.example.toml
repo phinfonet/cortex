@@ -1,0 +1,14 @@
+[monitor]
+socket_path = "/tmp/cortex.sock"
+
+[[lobes]]
+name = "my-project"
+path = "~/cortex/projects/my-project"
+
+[[suppliers]]
+name = "gemini"
+type = "gemini"
+
+[[suppliers]]
+name = "claude-code"
+type = "claude-code"
