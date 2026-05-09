@@ -1,9 +1,14 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use tokio::process::Command;
 
 pub async fn append(path: &str, content: &str) -> Result<()> {
     let output = Command::new("obsidian")
-        .args(["append", &format!("path={}", path), &format!("content={}", content), "silent"])
+        .args([
+            "append",
+            &format!("path={}", path),
+            &format!("content={}", content),
+            "silent",
+        ])
         .output()
         .await?;
 
@@ -19,7 +24,12 @@ pub async fn append(path: &str, content: &str) -> Result<()> {
 
 pub async fn create(name: &str, content: &str) -> Result<()> {
     let output = Command::new("obsidian")
-        .args(["create", &format!("name={}", name), &format!("content={}", content), "silent"])
+        .args([
+            "create",
+            &format!("name={}", name),
+            &format!("content={}", content),
+            "silent",
+        ])
         .output()
         .await?;
 

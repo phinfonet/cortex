@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use tokio::process::Command;
 
 pub struct SearchResult {
@@ -23,7 +23,11 @@ pub async fn read(path: &str) -> Result<String> {
 
 pub async fn search(query: &str, limit: usize) -> Result<Vec<SearchResult>> {
     let output = Command::new("obsidian")
-        .args(["search", &format!("query={}", query), &format!("limit={}", limit)])
+        .args([
+            "search",
+            &format!("query={}", query),
+            &format!("limit={}", limit),
+        ])
         .output()
         .await?;
 

@@ -1,10 +1,11 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Style},
     text::{Line, Span},
     widgets::Widget,
 };
+
+use super::theme;
 
 pub struct KeybindingBar<'a> {
     pub bindings: &'a [(&'a str, &'a str)],
@@ -18,15 +19,12 @@ impl Widget for KeybindingBar<'_> {
             .enumerate()
             .flat_map(|(i, (key, label))| {
                 let separator = if i > 0 {
-                    vec![Span::raw("  ")]
+                    vec![Span::styled("  ·  ", theme::style_dim())]
                 } else {
                     vec![]
                 };
-                let key_span = Span::styled(
-                    format!("[{}]", key),
-                    Style::default().fg(Color::Cyan),
-                );
-                let label_span = Span::raw(format!(" {}", label));
+                let key_span = Span::styled(format!("[{}]", key), theme::style_accent2());
+                let label_span = Span::styled(format!(" {}", label), theme::style_dim());
                 separator
                     .into_iter()
                     .chain([key_span, label_span])
@@ -34,6 +32,11 @@ impl Widget for KeybindingBar<'_> {
             })
             .collect();
 
-        Line::from(spans).render(area, buf);
+        ratatui::widgets::Block::default()
+            .style(theme::style_normal())
+            .render(area, buf);
+        Line::from(spans)
+            .style(theme::style_normal())
+            .render(area, buf);
     }
 }

@@ -1,3 +1,4 @@
+pub mod codex;
 pub mod gemini;
 
 #[async_trait::async_trait]

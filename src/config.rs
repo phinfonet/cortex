@@ -7,17 +7,32 @@ pub struct Config {
     pub monitor: MonitorConfig,
     pub lobes: Vec<Lobe>,
     pub suppliers: Vec<Supplier>,
+    pub agents_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct MonitorConfig {
     pub socket_path: PathBuf,
+    #[serde(default = "default_ui_socket_path")]
+    pub ui_socket_path: PathBuf,
+}
+
+fn default_ui_socket_path() -> PathBuf {
+    PathBuf::from("/tmp/cortex-ui.sock")
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Lobe {
     pub name: String,
     pub path: PathBuf,
+    /// Root dir scanned for project subdirectories. Uses `.lobe` marker to filter by lobe name.
+    pub projects_root: Option<PathBuf>,
+}
+
+impl Lobe {
+    pub fn agents_dir(&self) -> PathBuf {
+        self.path.join("agents")
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -66,5 +81,5 @@ fn dirs_path() -> PathBuf {
 }
 
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(PathBuf::from)
+    dirs::home_dir()
 }

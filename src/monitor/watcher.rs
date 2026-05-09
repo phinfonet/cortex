@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 
 use crate::config::Lobe;
 
-use super::event::{AppEvent, InquiryKind, InquiryMeta};
+use super::event::{AppEvent, InquiryKind, InquiryMeta, PlanMeta};
 
 pub struct FileWatcher {
     pub lobes: Vec<Lobe>,
@@ -31,10 +31,8 @@ impl FileWatcher {
         for result in notify_rx {
             match result {
                 Ok(event) => {
-                    let is_relevant = matches!(
-                        event.kind,
-                        EventKind::Modify(_) | EventKind::Create(_)
-                    );
+                    let is_relevant =
+                        matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_));
 
                     if !is_relevant {
                         continue;
@@ -69,8 +67,24 @@ impl FileWatcher {
 async fn build_event(lobe: String, path: &Path) -> AppEvent {
     if is_inquiry_file(path) {
         if let Some(meta) = parse_inquiry(path).await {
-            return AppEvent::InquiryDetected { lobe, inquiry: meta };
+            return AppEvent::InquiryDetected {
+                lobe,
+                inquiry: meta,
+            };
         }
+    }
+    if is_plan_file(path) {
+        return AppEvent::PlanDetected {
+            lobe: lobe.clone(),
+            plan: PlanMeta {
+                filename: path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                path: path.to_string_lossy().to_string(),
+                project: lobe,
+            },
+        };
     }
     AppEvent::FileChanged {
         lobe,
@@ -88,6 +102,18 @@ fn is_inquiry_file(path: &Path) -> bool {
     let is_md = path.extension().map(|e| e == "md").unwrap_or(false);
 
     in_inquiries && is_md
+}
+
+fn is_plan_file(path: &Path) -> bool {
+    let in_plans = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n == "plans")
+        .unwrap_or(false);
+
+    let is_md = path.extension().map(|e| e == "md").unwrap_or(false);
+
+    in_plans && is_md
 }
 
 #[derive(Debug, Deserialize)]
