@@ -49,6 +49,7 @@ enum Screen {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Section {
+    Agents,
     Review,
     Log,
 }
@@ -126,6 +127,7 @@ pub struct Tui {
     msg_tx: Option<mpsc::Sender<TuiMessage>>,
     daemon_connected: bool,
     new_idea_state: Option<NewIdeaState>,
+    tick: u64,
 }
 
 impl Tui {
@@ -145,7 +147,7 @@ impl Tui {
             requests,
             lobes,
             active_lobe_idx: 0,
-            active_section: Section::Review,
+            active_section: Section::Agents,
             review_items: Vec::new(),
             log_by_lobe,
             tasks_by_lobe,
@@ -162,6 +164,7 @@ impl Tui {
             msg_tx,
             daemon_connected,
             new_idea_state: None,
+            tick: 0,
         }
     }
 
@@ -210,6 +213,8 @@ impl Tui {
                 .iter()
                 .filter(|item| item.status == ReviewStatus::Pending)
                 .count();
+            let active_agent_count = active_tasks.len();
+            self.tick = self.tick.wrapping_add(1);
 
             terminal.draw(|frame| {
                 let area = frame.area();
@@ -228,6 +233,7 @@ impl Tui {
                             self.sidebar_selected_idx,
                             self.active_section,
                             pending_review_count,
+                            active_agent_count,
                             self.daemon_connected,
                             &active_tasks,
                             &active_reviews,
@@ -237,6 +243,7 @@ impl Tui {
                             &self.input_text,
                             &active_lobe,
                             self.command_context.as_deref(),
+                            self.tick,
                         );
                         let lobe_names: Vec<&str> =
                             self.lobes.iter().map(|l| l.name.as_str()).collect();
@@ -251,6 +258,7 @@ impl Tui {
                             self.sidebar_selected_idx,
                             self.active_section,
                             pending_review_count,
+                            active_agent_count,
                             self.daemon_connected,
                             &active_tasks,
                             &active_reviews,
@@ -260,6 +268,7 @@ impl Tui {
                             &self.input_text,
                             &active_lobe,
                             self.command_context.as_deref(),
+                            self.tick,
                         );
                     }
                     Screen::ReviewDetail(item) => {
@@ -277,6 +286,7 @@ impl Tui {
                             self.sidebar_selected_idx,
                             self.active_section,
                             pending_review_count,
+                            active_agent_count,
                             self.daemon_connected,
                             &active_tasks,
                             &active_reviews,
@@ -286,6 +296,7 @@ impl Tui {
                             &self.input_text,
                             &active_lobe,
                             self.command_context.as_deref(),
+                            self.tick,
                         );
                         if let Some(ref state) = self.new_idea_state {
                             layout::new_idea_modal(frame, &state.project_name, &state.input);
@@ -508,15 +519,11 @@ impl Tui {
                     }
                 }
             }
-            KeyCode::Char('a') => {
-                if self.focus == Focus::Content && self.active_section == Section::Review {
-                    self.set_selected_review_status(ReviewStatus::Accepted);
-                }
+            KeyCode::Char('a') if self.focus == Focus::Content && self.active_section == Section::Review => {
+                self.set_selected_review_status(ReviewStatus::Accepted);
             }
-            KeyCode::Char('r') => {
-                if self.focus == Focus::Content && self.active_section == Section::Review {
-                    self.set_selected_review_status(ReviewStatus::Rejected);
-                }
+            KeyCode::Char('r') if self.focus == Focus::Content && self.active_section == Section::Review => {
+                self.set_selected_review_status(ReviewStatus::Rejected);
             }
             KeyCode::Char('n') if self.focus == Focus::Sidebar => {
                 if let Some((project_name, vault_path)) = Self::selected_project_info(sidebar, self.sidebar_selected_idx) {
@@ -585,26 +592,27 @@ impl Tui {
     }
 
     fn sidebar_items(&self) -> Vec<layout::SidebarItem> {
-        let Some(lobe) = self.lobes.get(self.active_lobe_idx) else {
-            return Vec::new();
-        };
-        let projects = if let Some(ref root) = lobe.projects_root {
-            discover_projects_for_lobe(root, &lobe.name)
-                .into_iter()
-                .map(|(name, path)| layout::SidebarProject {
-                    components: parse_components_from_index(&path),
-                    name,
-                    path,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        vec![layout::SidebarItem {
-            lobe: lobe.name.clone(),
-            is_active: true,
-            projects,
-        }]
+        let active_name = self.lobes.get(self.active_lobe_idx).map(|l| l.name.as_str()).unwrap_or("");
+        self.lobes.iter().map(|lobe| {
+            let projects = if let Some(ref root) = lobe.projects_root {
+                discover_projects_for_lobe(root, &lobe.name)
+                    .into_iter()
+                    .map(|(name, path)| layout::SidebarProject {
+                        components: parse_components_from_index(&path),
+                        name,
+                        path,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            layout::SidebarItem {
+                lobe: lobe.name.clone(),
+                path: lobe.path.clone(),
+                is_active: lobe.name == active_name,
+                projects,
+            }
+        }).collect()
     }
 
     fn active_tasks(&self) -> Vec<TaskEntry> {
@@ -662,6 +670,7 @@ impl Tui {
 
     fn move_selection(&mut self, delta: isize) {
         match self.active_section {
+            Section::Agents => {}
             Section::Review => {
                 self.review_selected_idx =
                     move_idx(self.review_selected_idx, self.active_reviews().len(), delta);
@@ -679,32 +688,57 @@ impl Tui {
     fn move_sidebar_selection(&mut self, delta: isize, sidebar: &[layout::SidebarItem]) {
         let len = Self::nav_names_from_sidebar(sidebar).len();
         self.sidebar_selected_idx = move_idx(self.sidebar_selected_idx, len, delta);
+        if let Some(lobe_idx) = Self::lobe_idx_for_nav(sidebar, self.sidebar_selected_idx) {
+            self.active_lobe_idx = lobe_idx;
+        }
     }
 
-    /// Flat navigable list: project names interleaved with their components, in sidebar order.
+    /// Flat navigable list: lobe → projects → components, across all lobes.
     fn nav_names_from_sidebar(sidebar: &[layout::SidebarItem]) -> Vec<String> {
-        let Some(item) = sidebar.first() else { return Vec::new(); };
         let mut names = Vec::new();
-        for project in &item.projects {
-            names.push(project.name.clone());
-            names.extend(project.components.iter().cloned());
+        for item in sidebar {
+            names.push(item.lobe.clone());
+            for project in &item.projects {
+                names.push(project.name.clone());
+                names.extend(project.components.iter().cloned());
+            }
         }
         names
     }
 
-    fn selected_project_info(sidebar: &[layout::SidebarItem], nav_idx: usize) -> Option<(String, std::path::PathBuf)> {
-        let item = sidebar.first()?;
+    /// Returns the lobe index that owns the item at `nav_idx`.
+    fn lobe_idx_for_nav(sidebar: &[layout::SidebarItem], nav_idx: usize) -> Option<usize> {
         let mut counter = 0usize;
-        for project in &item.projects {
+        for (lobe_idx, item) in sidebar.iter().enumerate() {
+            let lobe_size = 1 + item.projects.iter().map(|p| 1 + p.components.len()).sum::<usize>();
+            if nav_idx < counter + lobe_size {
+                return Some(lobe_idx);
+            }
+            counter += lobe_size;
+        }
+        None
+    }
+
+    /// Returns (display_name, ideas_path) for the item at `nav_idx`.
+    /// Lobe → lobe path. Project/component → project path.
+    fn selected_project_info(sidebar: &[layout::SidebarItem], nav_idx: usize) -> Option<(String, std::path::PathBuf)> {
+        let mut counter = 0usize;
+        for item in sidebar {
             if counter == nav_idx {
-                return Some((project.name.clone(), project.path.clone()));
+                return Some((item.lobe.clone(), item.path.clone()));
             }
             counter += 1;
-            for _ in &project.components {
+            for project in &item.projects {
                 if counter == nav_idx {
                     return Some((project.name.clone(), project.path.clone()));
                 }
                 counter += 1;
+                for _ in &project.components {
+                    if counter == nav_idx {
+                        return Some((project.name.clone(), project.path.clone()));
+                    }
+                    counter += 1;
+                }
             }
         }
         None
@@ -749,9 +783,7 @@ impl Tui {
             self.push_log(&lobe, "⚠ daemon offline — command not sent".to_owned());
         }
         self.input_text.clear();
-        // Switch to Log tab so the user sees the → entry and any output that follows
-        self.active_section = Section::Log;
-        self.log_scroll = self.active_logs().len().saturating_sub(20) as u16;
+        self.active_section = Section::Agents;
     }
 
     fn reset_cursors(&mut self) {
@@ -851,14 +883,16 @@ fn create_idea_file(vault_path: &Path, title: &str) -> anyhow::Result<std::path:
 
 fn next_section(section: Section) -> Section {
     match section {
+        Section::Agents => Section::Review,
         Section::Review => Section::Log,
-        Section::Log => Section::Review,
+        Section::Log => Section::Agents,
     }
 }
 
 fn previous_section(section: Section) -> Section {
     match section {
-        Section::Review => Section::Log,
+        Section::Agents => Section::Log,
+        Section::Review => Section::Agents,
         Section::Log => Section::Review,
     }
 }

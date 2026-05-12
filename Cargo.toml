@@ -2,6 +2,7 @@
 name = "cortex"
 version = "0.1.0"
 edition = "2024"
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -17,3 +18,5 @@ notify = "7"
 reqwest = { version = "0.12", features = ["json"] }
 clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+dirs = "6"

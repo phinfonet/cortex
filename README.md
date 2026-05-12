@@ -1,5 +1,7 @@
 # cortex
 
+> This project is licensed under the GNU Affero General Public License v3.0 — see the [LICENSE](LICENSE) file for details.
+
 A terminal-first orchestration daemon for multi-agent AI workflows.
 
 Cortex runs as a background daemon that watches your knowledge vault, routes tasks to the right AI supplier (Gemini, Claude Code, Codex), and surfaces approvals and results through an interactive TUI — without everything going through a single context window.

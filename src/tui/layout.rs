@@ -23,6 +23,7 @@ pub struct SidebarProject {
 #[derive(Debug, Clone)]
 pub struct SidebarItem {
     pub lobe: String,
+    pub path: std::path::PathBuf,
     pub is_active: bool,
     pub projects: Vec<SidebarProject>,
 }
@@ -36,6 +37,7 @@ pub fn main_screen(
     sidebar_selected_idx: usize,
     active_section: Section,
     pending_review_count: usize,
+    active_agent_count: usize,
     daemon_connected: bool,
     tasks: &[TaskEntry],
     reviews: &[ReviewItem],
@@ -45,6 +47,7 @@ pub fn main_screen(
     input_text: &str,
     active_lobe_name: &str,
     command_context: Option<&str>,
+    tick: u64,
 ) {
     let area = frame.area();
 
@@ -58,7 +61,7 @@ pub fn main_screen(
         .constraints([Constraint::Length(30), Constraint::Min(1)])
         .split(rows[0]);
 
-    render_sidebar(frame, columns[0], sidebar_items, sidebar_selected_idx, tasks, focus, active_lobe_name);
+    render_sidebar(frame, columns[0], sidebar_items, sidebar_selected_idx, active_agent_count, focus, active_lobe_name, tick);
 
     let right_rows = Layout::default()
         .direction(Direction::Vertical)
@@ -72,9 +75,12 @@ pub fn main_screen(
         .split(columns[1]);
 
     render_header(frame, right_rows[0], active_lobe, daemon_connected);
-    render_section_tabs(frame, right_rows[1], active_section, pending_review_count);
+    render_section_tabs(frame, right_rows[1], active_section, pending_review_count, active_agent_count);
 
     match active_section {
+        Section::Agents => render_content_block(frame, right_rows[2], |frame, inner| {
+            render_agents(frame, inner, tasks, tick);
+        }),
         Section::Review => render_content_block(frame, right_rows[2], |frame, inner| {
             render_reviews(frame, inner, reviews, review_selected_idx);
         }),
@@ -91,9 +97,11 @@ pub fn main_screen(
     render_input_bar(frame, right_rows[4], focus, input_text, command_context);
 
     let bindings: &[(&str, &str)] = if focus == Focus::Sidebar {
-        &[("↑/↓", "nav"), ("enter", "ctx"), ("n", "idea"), ("i", "input"), ("spc", "lobes"), ("q", "quit")]
+        &[("↑/↓", "nav"), ("enter", "ctx"), ("n", "idea"), ("←/→", "focus"), ("spc", "lobes"), ("q", "quit")]
+    } else if active_section == Section::Review {
+        &[("↑/↓", "nav"), ("tab", "switch"), ("enter", "open"), ("a/r", "accept/reject"), ("i", "input"), ("q", "quit")]
     } else {
-        &[("↑/↓", "nav"), ("tab", "section"), ("enter", "open"), ("i", "input"), ("spc", "lobes"), ("q", "quit")]
+        &[("↑/↓", "nav"), ("tab", "switch"), ("i", "input"), ("←", "sidebar"), ("spc", "lobes"), ("q", "quit")]
     };
     KeybindingBar { bindings }.render(rows[1], frame.buffer_mut());
 }
@@ -126,9 +134,10 @@ fn render_sidebar(
     area: Rect,
     items: &[SidebarItem],
     selected_idx: usize,
-    tasks: &[TaskEntry],
+    running_count: usize,
     focus: Focus,
     active_lobe_name: &str,
+    tick: u64,
 ) {
     let block = Block::default()
         .borders(Borders::RIGHT)
@@ -140,93 +149,70 @@ fn render_sidebar(
 
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
-    // ── Section 1: project/component tree (always expanded) ─────
-    let Some(item) = items.first() else {
-        return;
-    };
-
     let w = inner.width as usize;
-    // Flat list of all rendered rows. nav_rows[nav_idx] = flat row index for that navigable item.
-    let mut flat_items: Vec<ListItem> = Vec::new();
-    let mut nav_rows: Vec<usize> = Vec::new(); // navigable flat indices, in sidebar order
-
-    // Lobe header (non-navigable)
-    flat_items.push(ListItem::new(Line::from(Span::styled(
-        format!(" ▾ {}", item.lobe),
-        theme::style_sidebar_header(),
-    ))));
-
     let is_focused = focus == Focus::Sidebar;
-    let project_count = item.projects.len();
+    let mut flat_items: Vec<ListItem> = Vec::new();
+    let mut nav_rows: Vec<usize> = Vec::new();
 
-    for (proj_idx, project) in item.projects.iter().enumerate() {
-        // nav_idx for this project = nav_rows.len() at the time we push
-        let proj_nav_idx = nav_rows.len();
-        let is_sel = proj_nav_idx == selected_idx;
-        let is_last_proj = proj_idx + 1 == project_count;
-
-        let proj_marker = if is_sel && is_focused {
-            "●"
-        } else if is_sel {
-            "◦"
-        } else if is_last_proj && project.components.is_empty() {
-            "╰"
-        } else {
-            "├"
-        };
-        let proj_style = if is_sel && is_focused {
+    for item in items {
+        // ── Lobe header (navigable) ─────────────────────────────
+        let lobe_nav_idx = nav_rows.len();
+        let is_lobe_sel = lobe_nav_idx == selected_idx;
+        let lobe_marker = if is_lobe_sel && is_focused { "●" } else if is_lobe_sel { "◦" } else { "▾" };
+        let lobe_style = if is_lobe_sel && is_focused {
             theme::style_sidebar_selected()
-        } else if is_sel {
-            theme::style_accent2()
+        } else if item.is_active {
+            theme::style_sidebar_header()
         } else {
-            theme::style_sidebar_item()
+            theme::style_sidebar_dim()
         };
-
-        let max_name = w.saturating_sub(4);
-        let proj_name = truncate_name(&project.name, max_name);
-
         nav_rows.push(flat_items.len());
         flat_items.push(ListItem::new(Line::from(Span::styled(
-            format!(" {proj_marker} {proj_name}"),
-            proj_style,
+            format!(" {lobe_marker} {}", item.lobe),
+            lobe_style,
         ))));
 
-        // Component rows
-        let comp_count = project.components.len();
-        for (comp_idx, comp) in project.components.iter().enumerate() {
-            let comp_nav_idx = nav_rows.len();
-            let is_comp_sel = comp_nav_idx == selected_idx;
-            let is_last_comp = comp_idx + 1 == comp_count;
-            let is_last_in_tree = is_last_proj && is_last_comp;
+        // ── Projects ────────────────────────────────────────────
+        let project_count = item.projects.len();
+        for (proj_idx, project) in item.projects.iter().enumerate() {
+            let proj_nav_idx = nav_rows.len();
+            let is_sel = proj_nav_idx == selected_idx;
+            let is_last_proj = proj_idx + 1 == project_count;
 
-            let comp_marker = if is_comp_sel && is_focused {
-                "●"
-            } else if is_comp_sel {
-                "◦"
-            } else if is_last_in_tree {
-                "╰"
-            } else {
-                "├"
-            };
-            let comp_style = if is_comp_sel && is_focused {
-                theme::style_sidebar_selected()
-            } else if is_comp_sel {
-                theme::style_accent2()
-            } else {
-                theme::style_sidebar_dim()
-            };
+            let proj_marker = if is_sel && is_focused { "●" } else if is_sel { "◦" }
+                else if is_last_proj && project.components.is_empty() { "╰" } else { "├" };
+            let proj_style = if is_sel && is_focused { theme::style_sidebar_selected() }
+                else if is_sel { theme::style_accent2() } else { theme::style_sidebar_item() };
 
-            let max_comp = w.saturating_sub(6);
-            let comp_name = truncate_name(comp, max_comp);
-
+            let proj_name = truncate_name(&project.name, w.saturating_sub(4));
             nav_rows.push(flat_items.len());
             flat_items.push(ListItem::new(Line::from(Span::styled(
-                format!("   {comp_marker} {comp_name}"),
-                comp_style,
+                format!(" {proj_marker} {proj_name}"),
+                proj_style,
             ))));
+
+            // ── Components ──────────────────────────────────────
+            let comp_count = project.components.len();
+            for (comp_idx, comp) in project.components.iter().enumerate() {
+                let comp_nav_idx = nav_rows.len();
+                let is_comp_sel = comp_nav_idx == selected_idx;
+                let is_last_in_tree = is_last_proj && (comp_idx + 1 == comp_count);
+
+                let comp_marker = if is_comp_sel && is_focused { "●" } else if is_comp_sel { "◦" }
+                    else if is_last_in_tree { "╰" } else { "├" };
+                let comp_style = if is_comp_sel && is_focused { theme::style_sidebar_selected() }
+                    else if is_comp_sel { theme::style_accent2() } else { theme::style_sidebar_dim() };
+
+                let comp_name = truncate_name(comp, w.saturating_sub(6));
+                nav_rows.push(flat_items.len());
+                flat_items.push(ListItem::new(Line::from(Span::styled(
+                    format!("   {comp_marker} {comp_name}"),
+                    comp_style,
+                ))));
+            }
         }
     }
 
@@ -242,71 +228,20 @@ fn render_sidebar(
         .highlight_style(theme::style_sidebar_selected());
     frame.render_stateful_widget(tree_list, sections[0], &mut tree_state);
 
-    // ── Section 2: tasks ────────────────────────────────────────
-    let sep_area = Rect {
-        height: 1,
-        ..sections[1]
-    };
-    let tasks_area = Rect {
-        y: sections[1].y + 1,
-        height: sections[1].height.saturating_sub(1),
-        ..sections[1]
-    };
-
-    // single-render separator with embedded label
-    let sep_total = sep_area.width as usize;
-    let label = " Active ";
-    let dashes_each = sep_total.saturating_sub(label.len()) / 2;
-    let left_dashes = "─".repeat(dashes_each);
-    let right_dashes = "─".repeat(sep_total.saturating_sub(dashes_each + label.len()));
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(left_dashes, theme::style_border()),
-            Span::styled(label, theme::style_sidebar_header()),
-            Span::styled(right_dashes, theme::style_border()),
-        ])),
-        sep_area,
-    );
-
-    if tasks.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Span::styled("  idle", theme::style_sidebar_dim())),
-            tasks_area,
-        );
+    // Status footer
+    let footer = if running_count > 0 {
+        let spin = spinner_char(tick);
+        Line::from(vec![
+            Span::styled(format!(" {spin} "), theme::style_accent()),
+            Span::styled(format!("{running_count} running · {active_lobe_name}"), theme::style_orange()),
+        ])
     } else {
-        let task_items: Vec<ListItem> = tasks
-            .iter()
-            .map(|task| {
-                let icon = match task.kind {
-                    TaskKind::Plan => "⏳",
-                    TaskKind::Inquiry => "◎",
-                    TaskKind::Command => "▷",
-                };
-                let kind_label = match task.kind {
-                    TaskKind::Plan => "plan",
-                    TaskKind::Inquiry => "inquiry",
-                    TaskKind::Command => "cmd",
-                };
-                let name = if task.filename.len() > 14 {
-                    format!("{}…", &task.filename[..13])
-                } else {
-                    task.filename.clone()
-                };
-                ListItem::new(Text::from(vec![
-                    Line::from(vec![
-                        Span::styled(format!(" {icon} "), theme::style_orange()),
-                        Span::styled(active_lobe_name.to_owned(), theme::style_accent2()),
-                        Span::styled(format!(" · {kind_label}"), theme::style_sidebar_dim()),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(format!("   {name}"), theme::style_sidebar_item()),
-                    ]),
-                ]))
-            })
-            .collect();
-        let list = List::new(task_items).style(theme::style_sidebar_bg());
-        frame.render_widget(list, tasks_area);
-    }
+        Line::from(Span::styled(
+            format!("  ○  idle · {active_lobe_name}"),
+            theme::style_sidebar_dim(),
+        ))
+    };
+    frame.render_widget(Paragraph::new(footer), sections[1]);
 }
 
 fn render_section_tabs(
@@ -314,9 +249,10 @@ fn render_section_tabs(
     area: Rect,
     active_section: Section,
     pending_review_count: usize,
+    active_agent_count: usize,
 ) {
     let mut spans = vec![Span::styled("──", theme::style_border())];
-    push_section_spans(&mut spans, active_section, pending_review_count, Span::styled("──·──", theme::style_border()));
+    push_section_spans(&mut spans, active_section, pending_review_count, active_agent_count, Span::styled("──·──", theme::style_border()));
 
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(theme::style_normal()),
@@ -328,44 +264,34 @@ fn push_section_spans(
     spans: &mut Vec<Span<'static>>,
     active_section: Section,
     pending_review_count: usize,
+    active_agent_count: usize,
     separator: Span<'static>,
 ) {
-    let sections = [
-        (
-            Section::Review,
-            if pending_review_count > 0 {
-                format!("Review·{pending_review_count}")
-            } else {
-                "Review".to_owned()
-            },
-        ),
-        (Section::Log, "Log".to_owned()),
+    struct Tab { section: Section, label: String, badge: Option<String> }
+
+    let tabs = [
+        Tab {
+            section: Section::Agents,
+            label: "Agents".to_owned(),
+            badge: if active_agent_count > 0 { Some(active_agent_count.to_string()) } else { None },
+        },
+        Tab {
+            section: Section::Review,
+            label: "Review".to_owned(),
+            badge: if pending_review_count > 0 { Some(pending_review_count.to_string()) } else { None },
+        },
+        Tab { section: Section::Log, label: "Log".to_owned(), badge: None },
     ];
 
-    for (idx, (section, label)) in sections.into_iter().enumerate() {
+    for (idx, tab) in tabs.into_iter().enumerate() {
         if idx > 0 {
             spans.push(separator.clone());
         }
-        if section == Section::Review && pending_review_count > 0 {
-            let (prefix, badge) = label.split_once('·').unwrap_or((label.as_str(), ""));
-            spans.push(Span::styled(
-                prefix.to_owned(),
-                if section == active_section {
-                    theme::style_section_active()
-                } else {
-                    theme::style_section_inactive()
-                },
-            ));
+        let is_active = tab.section == active_section;
+        let label_style = if is_active { theme::style_section_active() } else { theme::style_section_inactive() };
+        spans.push(Span::styled(tab.label, label_style));
+        if let Some(badge) = tab.badge {
             spans.push(Span::styled(format!("·{badge}"), theme::style_warning()));
-        } else {
-            spans.push(Span::styled(
-                label,
-                if section == active_section {
-                    theme::style_section_active()
-                } else {
-                    theme::style_section_inactive()
-                },
-            ));
         }
     }
 }
@@ -699,6 +625,53 @@ pub fn approval(frame: &mut Frame, request: &ApprovalRequest) {
         bindings: &[("a", "Accept"), ("r", "Reject"), ("esc", "Cancel")],
     }
     .render(sections[1], frame.buffer_mut());
+}
+
+fn spinner_char(tick: u64) -> &'static str {
+    const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    FRAMES[(tick / 3) as usize % FRAMES.len()]
+}
+
+fn render_agents(frame: &mut Frame, area: Rect, tasks: &[TaskEntry], tick: u64) {
+    if tasks.is_empty() {
+        let msg = Paragraph::new(Line::from(vec![
+            Span::styled("○  ", theme::style_sidebar_dim()),
+            Span::styled("idle — no active agents", theme::style_dim()),
+        ]))
+        .alignment(ratatui::layout::Alignment::Center)
+        .style(theme::style_normal());
+        frame.render_widget(msg, center_vertically(area, 1));
+        return;
+    }
+
+    let spin = spinner_char(tick);
+
+    let items: Vec<ListItem> = tasks
+        .iter()
+        .map(|task| {
+            let (kind_label, kind_style) = match task.kind {
+                TaskKind::Plan    => ("plan   ", theme::style_accent2()),
+                TaskKind::Inquiry => ("inquiry", theme::style_accent()),
+                TaskKind::Command => ("cmd    ", theme::style_orange()),
+            };
+            let name = truncate_name(&task.filename, area.width.saturating_sub(16) as usize);
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("  {spin}  "), theme::style_accent()),
+                Span::styled(kind_label, kind_style),
+                Span::styled("  ", theme::style_dim()),
+                Span::styled(name, theme::style_normal()),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items).style(theme::style_normal());
+    frame.render_widget(list, area);
+}
+
+/// Returns a horizontally-full, vertically-centered rect of `lines` height within `area`.
+fn center_vertically(area: Rect, lines: u16) -> Rect {
+    let offset = area.height.saturating_sub(lines) / 2;
+    Rect { y: area.y + offset, height: lines, ..area }
 }
 
 pub fn new_idea_modal(frame: &mut Frame, project_name: &str, input: &str) {

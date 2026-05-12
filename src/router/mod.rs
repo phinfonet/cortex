@@ -175,6 +175,16 @@ impl Router {
                     return Ok(());
                 }
 
+                // Resolve the actual code directory: projects_root > lobe.path > ~/Stuff
+                let lobe_config = self.lobes.iter().find(|l| l.name == lobe);
+                let code_dir: PathBuf = lobe_config
+                    .and_then(|l| l.projects_root.as_ref())
+                    .cloned()
+                    .or_else(|| lobe_config.map(|l| l.path.clone()))
+                    .unwrap_or_else(|| {
+                        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Stuff")
+                    });
+
                 let _ = self
                     .tx
                     .send(AppEvent::PlanStarted {
@@ -188,15 +198,25 @@ impl Router {
                     .map(|name| format!("@{}", name))
                     .unwrap_or_else(|| "@synapse".to_string());
                 let prompt = format!(
-                    "{} New plan at {} for project '{}'.     Read the plan and follow this review workflow exactly:\n    1. Read the plan frontmatter — use the 'branch' field as the target branch.     If absent, derive it as 'cortex/{}'.\n    2. In the project's git repo (under ~/Stuff/{}/ or similar), checkout that branch     (create from current HEAD if it doesn't exist).\n    3. Execute the plan — write files, never commit.\n    4. Run 'git diff HEAD' to get a summary of all changes.\n    5. If the plan has 'review: opus', or if any changed file is a migration,     auth module, or security-sensitive — spawn an Opus subagent to validate the diff.\n    6. Send a push notification: branch name + count of files changed + one-line summary.",
+                    "{} New plan at {} for project '{}'.\
+    Read the plan and follow this review workflow exactly:\n\
+    1. Read the plan frontmatter — use the 'branch' field as the target branch. \
+    If absent, derive it as 'cortex/{}'.\n\
+    2. In the project's git repo (under {}/ — pick the right subdirectory), \
+    checkout that branch (create from current HEAD if it doesn't exist).\n\
+    3. Execute the plan — write files, never commit.\n\
+    4. Run 'git diff HEAD' to get a summary of all changes.\n\
+    5. If the plan has 'review: opus', or if any changed file is a migration, \
+    auth module, or security-sensitive — spawn an Opus subagent to validate the diff.\n\
+    6. Send a push notification: branch name + count of files changed + one-line summary.",
                     agent_mention,
                     plan.path,
                     plan.project,
                     plan.filename.trim_end_matches(".md"),
-                    plan.project
+                    code_dir.display(),
                 );
 
-                let home = std::env::var("HOME").unwrap_or_default();
+                let code_dir_str = code_dir.to_string_lossy().to_string();
                 let output = Command::new("claude")
                     .args([
                         "-p",
@@ -204,35 +224,17 @@ impl Router {
                         "--allowedTools",
                         "Bash,Read,Edit,Write,Agent,WebSearch,WebFetch,PushNotification,mcp__obsidian__*,mcp__gemini__*",
                         "--add-dir",
-                        &format!("{}/Stuff", home),
+                        &code_dir_str,
+                        "--dangerouslySkipPermissions",
                     ])
                     .output()
                     .await?;
 
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                let output_text = format!("{}{}", stdout, stderr).to_lowercase();
 
-                if output_text.contains("permission")
-                    || output_text.contains("not been granted")
-                    || output_text.contains("approve")
-                {
-                    let _ = self
-                        .tx
-                        .send(AppEvent::PlanNeedsPermission {
-                            lobe,
-                            filename: plan.filename,
-                        })
-                        .await;
-                } else if output.status.success() {
-                    let diff = Command::new("git")
-                        .args(["diff", "HEAD"])
-                        .current_dir(format!("{}/Stuff/{}", home, plan.project))
-                        .output()
-                        .await
-                        .ok()
-                        .filter(|o| o.status.success())
-                        .map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+                if output.status.success() {
+                    let diff = capture_diff(&code_dir).await;
                     let summary = stdout.chars().take(500).collect();
                     let _ = self
                         .tx
@@ -313,6 +315,38 @@ impl Router {
 
         Ok(())
     }
+}
+
+/// Run `git diff HEAD` in `dir` and, if that fails (not a git root), try each immediate subdir.
+/// Returns the first non-empty diff found, or None.
+async fn capture_diff(dir: &std::path::Path) -> Option<String> {
+    // Try the dir itself first
+    if let Some(diff) = git_diff_in(dir).await {
+        return Some(diff);
+    }
+    // Walk immediate subdirs
+    let Ok(entries) = std::fs::read_dir(dir) else { return None; };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(diff) = git_diff_in(&path).await {
+                return Some(diff);
+            }
+        }
+    }
+    None
+}
+
+async fn git_diff_in(dir: &std::path::Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["diff", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() { return None; }
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    if text.trim().is_empty() { None } else { Some(text) }
 }
 
 async fn run_claude_command(prompt: &str) -> anyhow::Result<String> {

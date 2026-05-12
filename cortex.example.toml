@@ -1,9 +1,14 @@
 [monitor]
 socket_path = "/tmp/cortex.sock"
+ui_socket_path = "/tmp/cortex-ui.sock"
+
+# Optional: global agents directory (fallback when lobe has no agents_dir)
+# agents_dir = "~/.config/cortex/agents"
 
 [[lobes]]
 name = "my-project"
 path = "~/cortex/projects/my-project"
+# agents_dir = "~/my-project/agents"   # lobe-specific agents (lookup priority)
 
 [[suppliers]]
 name = "gemini"
