@@ -193,12 +193,18 @@ impl Router {
                     })
                     .await;
 
+                let lobe_agents_dir_opt = lobe_config.map(|l| l.agents_dir());
+                let agent_content = if let Some(ref name) = agent {
+                    resolve_agent(name, lobe_agents_dir_opt.as_ref(), self.global_agents_dir.as_ref()).await
+                } else {
+                    None
+                };
                 let agent_mention = agent
                     .as_deref()
                     .map(|name| format!("@{}", name))
                     .unwrap_or_else(|| "@synapse".to_string());
-                let prompt = format!(
-                    "{} New plan at {} for project '{}'.\
+                let workflow = format!(
+                    "New plan at {} for project '{}'.\
     Read the plan and follow this review workflow exactly:\n\
     1. Read the plan frontmatter — use the 'branch' field as the target branch. \
     If absent, derive it as 'cortex/{}'.\n\
@@ -209,15 +215,18 @@ impl Router {
     5. If the plan has 'review: opus', or if any changed file is a migration, \
     auth module, or security-sensitive — spawn an Opus subagent to validate the diff.\n\
     6. Send a push notification: branch name + count of files changed + one-line summary.",
-                    agent_mention,
                     plan.path,
                     plan.project,
                     plan.filename.trim_end_matches(".md"),
                     code_dir.display(),
                 );
+                let prompt = match agent_content {
+                    Some(content) => format!("{}\n\n---\n\n{}", content, workflow),
+                    None => format!("{} {}", agent_mention, workflow),
+                };
 
                 let code_dir_str = code_dir.to_string_lossy().to_string();
-                let output = Command::new("claude")
+                let subprocess_result = Command::new("claude")
                     .args([
                         "-p",
                         &prompt,
@@ -225,36 +234,54 @@ impl Router {
                         "Bash,Read,Edit,Write,Agent,WebSearch,WebFetch,PushNotification,mcp__obsidian__*,mcp__gemini__*",
                         "--add-dir",
                         &code_dir_str,
-                        "--dangerouslySkipPermissions",
+                        "--dangerously-skip-permissions",
                     ])
                     .output()
-                    .await?;
+                    .await;
 
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
+                match subprocess_result {
+                    Err(err) => {
+                        let _ = self
+                            .tx
+                            .send(AppEvent::PlanFailed {
+                                lobe,
+                                filename: plan.filename,
+                                reason: format!("spawn error: {err}"),
+                            })
+                            .await;
+                    }
+                    Ok(output) => {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let stderr = String::from_utf8_lossy(&output.stderr);
 
-                if output.status.success() {
-                    let diff = capture_diff(&code_dir).await;
-                    let summary = stdout.chars().take(500).collect();
-                    let _ = self
-                        .tx
-                        .send(AppEvent::PlanCompleted {
-                            lobe,
-                            filename: plan.filename,
-                            summary,
-                            diff,
-                        })
-                        .await;
-                } else {
-                    let reason = stderr.chars().take(200).collect();
-                    let _ = self
-                        .tx
-                        .send(AppEvent::PlanFailed {
-                            lobe,
-                            filename: plan.filename,
-                            reason,
-                        })
-                        .await;
+                        if output.status.success() {
+                            let diff = capture_diff(&code_dir).await;
+                            let summary = stdout.chars().take(500).collect();
+                            let _ = self
+                                .tx
+                                .send(AppEvent::PlanCompleted {
+                                    lobe,
+                                    filename: plan.filename,
+                                    summary,
+                                    diff,
+                                })
+                                .await;
+                        } else {
+                            let reason = if stderr.trim().is_empty() {
+                                stdout.chars().take(200).collect()
+                            } else {
+                                stderr.chars().take(200).collect()
+                            };
+                            let _ = self
+                                .tx
+                                .send(AppEvent::PlanFailed {
+                                    lobe,
+                                    filename: plan.filename,
+                                    reason,
+                                })
+                                .await;
+                        }
+                    }
                 }
             }
             AppEvent::CommandReceived { lobe, text } => {
@@ -295,9 +322,17 @@ impl Router {
                     };
                     CodexSupplier.run(&prompt).await
                 } else {
-                    let agent_mention = format!("@{}", agent_name);
-                    let prompt = format!("{agent_mention} {body}");
-                    run_claude_command(&prompt).await
+                    let claude_lobe = self.lobes.iter().find(|l| l.name == lobe);
+                    let claude_agents_dir = claude_lobe.map(|l| l.agents_dir());
+                    let claude_code_dir: PathBuf = claude_lobe
+                        .and_then(|l| l.projects_root.as_ref()).cloned()
+                        .or_else(|| claude_lobe.map(|l| l.path.clone()))
+                        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Stuff"));
+                    let prompt = match resolve_agent(&agent_name, claude_agents_dir.as_ref(), self.global_agents_dir.as_ref()).await {
+                        Some(content) => format!("{}\n\n---\n\n{}", content, body),
+                        None => format!("@{agent_name} {body}"),
+                    };
+                    run_claude_command(&prompt, &claude_code_dir).await
                 };
 
                 let output = match result {
@@ -349,8 +384,7 @@ async fn git_diff_in(dir: &std::path::Path) -> Option<String> {
     if text.trim().is_empty() { None } else { Some(text) }
 }
 
-async fn run_claude_command(prompt: &str) -> anyhow::Result<String> {
-    let home = std::env::var("HOME").unwrap_or_default();
+async fn run_claude_command(prompt: &str, code_dir: &std::path::Path) -> anyhow::Result<String> {
     let output = Command::new("claude")
         .args([
             "-p",
@@ -358,7 +392,8 @@ async fn run_claude_command(prompt: &str) -> anyhow::Result<String> {
             "--allowedTools",
             "Bash,Read,Edit,Write,Agent,WebSearch,WebFetch,PushNotification,mcp__obsidian__*,mcp__gemini__*",
             "--add-dir",
-            &format!("{}/Stuff", home),
+            &code_dir.to_string_lossy().to_string(),
+            "--dangerously-skip-permissions",
         ])
         .output()
         .await?;

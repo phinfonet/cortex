@@ -50,8 +50,55 @@ enum Screen {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Section {
     Agents,
+    Plans,
+    Inquiries,
     Review,
     Log,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InputMode {
+    Command,
+    NewPlan,
+    NewInquiry,
+}
+
+impl InputMode {
+    pub fn next(self) -> Self {
+        match self {
+            InputMode::Command => InputMode::NewPlan,
+            InputMode::NewPlan => InputMode::NewInquiry,
+            InputMode::NewInquiry => InputMode::Command,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            InputMode::Command => "cmd",
+            InputMode::NewPlan => "plan",
+            InputMode::NewInquiry => "inquiry",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlanFileState {
+    Active,
+    Completed,
+    Pending,
+}
+
+#[derive(Debug, Clone)]
+pub enum PlanFileKind {
+    Plan,
+    Inquiry,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanFileEntry {
+    pub filename: String,
+    pub project: String,
+    pub kind: PlanFileKind,
+    pub state: PlanFileState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -114,12 +161,15 @@ pub struct Tui {
     tasks_by_lobe: HashMap<String, Vec<TaskEntry>>,
     focus: Focus,
     input_text: String,
+    pub input_mode: InputMode,
     /// Index within the active lobe's navigable items (components)
     sidebar_selected_idx: usize,
     /// Currently selected component/project context for commands
     command_context: Option<String>,
+    /// Path of the currently selected project (for plan/inquiry creation)
+    context_path: Option<std::path::PathBuf>,
     review_selected_idx: usize,
-    log_scroll: u16,
+    log_selected_idx: usize,
     detail_scroll: u16,
     events_rx: Option<mpsc::Receiver<String>>,
     review_rx: Option<mpsc::Receiver<ReviewItem>>,
@@ -153,10 +203,12 @@ impl Tui {
             tasks_by_lobe,
             focus: Focus::Content,
             input_text: String::new(),
+            input_mode: InputMode::Command,
             sidebar_selected_idx: 0,
             command_context: None,
+            context_path: None,
             review_selected_idx: 0,
-            log_scroll: 0,
+            log_selected_idx: usize::MAX,
             detail_scroll: 0,
             events_rx,
             review_rx,
@@ -205,6 +257,13 @@ impl Tui {
         loop {
             let active_lobe = self.active_lobe_name();
             let sidebar_items = self.sidebar_items(); // filesystem read — do once per frame
+            let all_work = self.active_plan_files();
+            let plan_files: Vec<PlanFileEntry> = all_work.iter()
+                .filter(|f| matches!(f.kind, PlanFileKind::Plan))
+                .cloned().collect();
+            let inquiry_files: Vec<PlanFileEntry> = all_work.iter()
+                .filter(|f| matches!(f.kind, PlanFileKind::Inquiry))
+                .cloned().collect();
             self.clamp_selection_with(&sidebar_items);
             let active_tasks = self.active_tasks();
             let active_reviews = self.active_reviews();
@@ -236,13 +295,16 @@ impl Tui {
                             active_agent_count,
                             self.daemon_connected,
                             &active_tasks,
+                            &plan_files,
+                            &inquiry_files,
                             &active_reviews,
                             self.review_selected_idx,
                             &active_logs,
-                            self.log_scroll,
+                            self.log_selected_idx,
                             &self.input_text,
                             &active_lobe,
                             self.command_context.as_deref(),
+                            self.input_mode,
                             self.tick,
                         );
                         let lobe_names: Vec<&str> =
@@ -261,13 +323,16 @@ impl Tui {
                             active_agent_count,
                             self.daemon_connected,
                             &active_tasks,
+                            &plan_files,
+                            &inquiry_files,
                             &active_reviews,
                             self.review_selected_idx,
                             &active_logs,
-                            self.log_scroll,
+                            self.log_selected_idx,
                             &self.input_text,
                             &active_lobe,
                             self.command_context.as_deref(),
+                            self.input_mode,
                             self.tick,
                         );
                     }
@@ -289,13 +354,16 @@ impl Tui {
                             active_agent_count,
                             self.daemon_connected,
                             &active_tasks,
+                            &plan_files,
+                            &inquiry_files,
                             &active_reviews,
                             self.review_selected_idx,
                             &active_logs,
-                            self.log_scroll,
+                            self.log_selected_idx,
                             &self.input_text,
                             &active_lobe,
                             self.command_context.as_deref(),
+                            self.input_mode,
                             self.tick,
                         );
                         if let Some(ref state) = self.new_idea_state {
@@ -446,13 +514,24 @@ impl Tui {
     async fn handle_main_key(&mut self, code: KeyCode, screen: &mut Screen, sidebar: &[layout::SidebarItem]) -> Result<bool> {
         if self.focus == Focus::Input {
             match code {
-                KeyCode::Esc => self.focus = Focus::Content,
+                KeyCode::Tab => {
+                    self.input_mode = self.input_mode.next();
+                }
+                KeyCode::Esc => {
+                    self.focus = Focus::Content;
+                    self.input_mode = InputMode::Command;
+                }
                 KeyCode::Backspace => {
                     self.input_text.pop();
                 }
                 KeyCode::Enter => {
-                    self.submit_input_command();
+                    match self.input_mode {
+                        InputMode::Command => self.submit_input_command(),
+                        InputMode::NewPlan => self.submit_new_file(PlanFileKind::Plan),
+                        InputMode::NewInquiry => self.submit_new_file(PlanFileKind::Inquiry),
+                    }
                     self.focus = Focus::Content;
+                    self.input_mode = InputMode::Command;
                 }
                 KeyCode::Char(c) => {
                     self.input_text.push(c);
@@ -487,7 +566,10 @@ impl Tui {
                     let ctx = name.clone();
                     if self.command_context.as_deref() == Some(&ctx) {
                         self.command_context = None;
+                        self.context_path = None;
                     } else {
+                        self.context_path = Self::selected_project_info(sidebar, self.sidebar_selected_idx)
+                            .map(|(_, p)| p);
                         self.command_context = Some(ctx);
                     }
                 }
@@ -516,6 +598,19 @@ impl Tui {
                     if let Some(item) = self.selected_review().cloned() {
                         self.detail_scroll = 0;
                         *screen = Screen::ReviewDetail(item);
+                    }
+                } else if self.focus == Focus::Content && self.active_section == Section::Log {
+                    let logs = self.active_logs();
+                    if let Some(entry) = logs.get(self.log_selected_idx) {
+                        // Strip "→ " prefix from sent commands, then strip [lobe] prefix
+                        let text = entry.strip_prefix("→ ").unwrap_or(entry.as_str());
+                        let text = if let Some(rest) = text.strip_prefix('[') {
+                            if let Some((_, msg)) = rest.split_once("] ") { msg } else { text }
+                        } else {
+                            text
+                        };
+                        self.input_text = text.to_owned();
+                        self.focus = Focus::Input;
                     }
                 }
             }
@@ -592,27 +687,75 @@ impl Tui {
     }
 
     fn sidebar_items(&self) -> Vec<layout::SidebarItem> {
-        let active_name = self.lobes.get(self.active_lobe_idx).map(|l| l.name.as_str()).unwrap_or("");
-        self.lobes.iter().map(|lobe| {
-            let projects = if let Some(ref root) = lobe.projects_root {
-                discover_projects_for_lobe(root, &lobe.name)
-                    .into_iter()
-                    .map(|(name, path)| layout::SidebarProject {
-                        components: parse_components_from_index(&path),
-                        name,
-                        path,
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            layout::SidebarItem {
-                lobe: lobe.name.clone(),
-                path: lobe.path.clone(),
-                is_active: lobe.name == active_name,
-                projects,
+        let Some(lobe) = self.lobes.get(self.active_lobe_idx) else {
+            return Vec::new();
+        };
+        // Vault root: parent of projects_root (e.g., ~/cortex/), falling back to lobe.path.
+        let vault_root = lobe.projects_root.as_ref()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| lobe.path.clone());
+        let projects = if let Some(ref root) = lobe.projects_root {
+            discover_projects_for_lobe(root, &lobe.name)
+                .into_iter()
+                .map(|(name, path)| layout::SidebarProject {
+                    folders: discover_operational_folders(&path),
+                    components: parse_components_from_index(&path),
+                    name,
+                    path,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        vec![layout::SidebarItem {
+            lobe: lobe.name.clone(),
+            path: vault_root,
+            is_active: true,
+            projects,
+        }]
+    }
+
+    fn active_plan_files(&self) -> Vec<PlanFileEntry> {
+        let lobe_name = self.active_lobe_name();
+        let Some(lobe) = self.lobes.get(self.active_lobe_idx) else { return Vec::new(); };
+        let root = lobe.projects_root.as_ref().unwrap_or(&lobe.path);
+        let active_tasks = self.active_tasks();
+        let review_filenames: std::collections::HashSet<String> = self.review_items.iter()
+            .filter(|r| r.lobe == lobe_name)
+            .map(|r| r.filename.clone())
+            .collect();
+
+        let mut entries = Vec::new();
+        let Ok(dirs) = std::fs::read_dir(root) else { return Vec::new(); };
+        for dir_entry in dirs.filter_map(|e| e.ok()) {
+            if !dir_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
+            let project_name = dir_entry.file_name().to_string_lossy().to_string();
+            for (subdir, kind) in &[("plans", PlanFileKind::Plan), ("inquiries", PlanFileKind::Inquiry)] {
+                let subdir_path = dir_entry.path().join(subdir);
+                let Ok(files) = std::fs::read_dir(&subdir_path) else { continue; };
+                for file_entry in files.filter_map(|e| e.ok()) {
+                    let path = file_entry.path();
+                    if path.extension().map(|e| e == "md").unwrap_or(false) {
+                        let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        let state = if active_tasks.iter().any(|t| t.filename == filename) {
+                            PlanFileState::Active
+                        } else if review_filenames.contains(&filename) {
+                            PlanFileState::Completed
+                        } else {
+                            PlanFileState::Pending
+                        };
+                        entries.push(PlanFileEntry {
+                            filename,
+                            project: project_name.clone(),
+                            kind: kind.clone(),
+                            state,
+                        });
+                    }
+                }
             }
-        }).collect()
+        }
+        entries.sort_by(|a, b| a.filename.cmp(&b.filename));
+        entries
     }
 
     fn active_tasks(&self) -> Vec<TaskEntry> {
@@ -670,17 +813,14 @@ impl Tui {
 
     fn move_selection(&mut self, delta: isize) {
         match self.active_section {
-            Section::Agents => {}
+            Section::Agents | Section::Plans | Section::Inquiries => {}
             Section::Review => {
                 self.review_selected_idx =
                     move_idx(self.review_selected_idx, self.active_reviews().len(), delta);
             }
             Section::Log => {
-                if delta < 0 {
-                    self.log_scroll = self.log_scroll.saturating_sub(1);
-                } else {
-                    self.log_scroll = self.log_scroll.saturating_add(delta as u16);
-                }
+                self.log_selected_idx =
+                    move_idx(self.log_selected_idx, self.active_logs().len(), delta);
             }
         }
     }
@@ -688,57 +828,45 @@ impl Tui {
     fn move_sidebar_selection(&mut self, delta: isize, sidebar: &[layout::SidebarItem]) {
         let len = Self::nav_names_from_sidebar(sidebar).len();
         self.sidebar_selected_idx = move_idx(self.sidebar_selected_idx, len, delta);
-        if let Some(lobe_idx) = Self::lobe_idx_for_nav(sidebar, self.sidebar_selected_idx) {
-            self.active_lobe_idx = lobe_idx;
-        }
     }
 
-    /// Flat navigable list: lobe → projects → components, across all lobes.
+    /// Flat navigable list: lobe header → projects → (folders, components) per project.
     fn nav_names_from_sidebar(sidebar: &[layout::SidebarItem]) -> Vec<String> {
-        let mut names = Vec::new();
-        for item in sidebar {
-            names.push(item.lobe.clone());
-            for project in &item.projects {
-                names.push(project.name.clone());
-                names.extend(project.components.iter().cloned());
-            }
+        let Some(item) = sidebar.first() else { return Vec::new(); };
+        let mut names = vec![item.lobe.clone()];
+        for project in &item.projects {
+            names.push(project.name.clone());
+            names.extend(project.folders.iter().cloned());
+            names.extend(project.components.iter().cloned());
         }
         names
     }
 
-    /// Returns the lobe index that owns the item at `nav_idx`.
-    fn lobe_idx_for_nav(sidebar: &[layout::SidebarItem], nav_idx: usize) -> Option<usize> {
-        let mut counter = 0usize;
-        for (lobe_idx, item) in sidebar.iter().enumerate() {
-            let lobe_size = 1 + item.projects.iter().map(|p| 1 + p.components.len()).sum::<usize>();
-            if nav_idx < counter + lobe_size {
-                return Some(lobe_idx);
-            }
-            counter += lobe_size;
-        }
-        None
-    }
-
-    /// Returns (display_name, ideas_path) for the item at `nav_idx`.
-    /// Lobe → lobe path. Project/component → project path.
+    /// Returns (display_name, ideas_root_path) for the item at `nav_idx`.
+    /// Lobe → lobe.path. Project/folder/component → project.path.
     fn selected_project_info(sidebar: &[layout::SidebarItem], nav_idx: usize) -> Option<(String, std::path::PathBuf)> {
+        let item = sidebar.first()?;
         let mut counter = 0usize;
-        for item in sidebar {
+        if counter == nav_idx {
+            return Some((item.lobe.clone(), item.path.clone()));
+        }
+        counter += 1;
+        for project in &item.projects {
             if counter == nav_idx {
-                return Some((item.lobe.clone(), item.path.clone()));
+                return Some((project.name.clone(), project.path.clone()));
             }
             counter += 1;
-            for project in &item.projects {
+            for _ in &project.folders {
                 if counter == nav_idx {
                     return Some((project.name.clone(), project.path.clone()));
                 }
                 counter += 1;
-                for _ in &project.components {
-                    if counter == nav_idx {
-                        return Some((project.name.clone(), project.path.clone()));
-                    }
-                    counter += 1;
+            }
+            for _ in &project.components {
+                if counter == nav_idx {
+                    return Some((project.name.clone(), project.path.clone()));
                 }
+                counter += 1;
             }
         }
         None
@@ -748,6 +876,10 @@ impl Tui {
         let count = Self::nav_names_from_sidebar(sidebar).len();
         self.sidebar_selected_idx = clamp_idx(self.sidebar_selected_idx, count);
         self.review_selected_idx = clamp_idx(self.review_selected_idx, self.active_reviews().len());
+        let log_len = self.active_logs().len();
+        if log_len > 0 {
+            self.log_selected_idx = clamp_idx(self.log_selected_idx, log_len);
+        }
     }
 
     fn submit_input_command(&mut self) {
@@ -790,7 +922,46 @@ impl Tui {
         self.review_selected_idx = 0;
         self.sidebar_selected_idx = 0;
         self.command_context = None;
-        self.log_scroll = 0;
+        self.context_path = None;
+        self.input_mode = InputMode::Command;
+        self.log_selected_idx = usize::MAX;
+    }
+
+    fn submit_new_file(&mut self, kind: PlanFileKind) {
+        let title = self.input_text.trim().to_owned();
+        self.input_text.clear();
+        if title.is_empty() { return; }
+
+        let lobe = self.active_lobe_name();
+        let target = self.context_path.clone().or_else(|| {
+            let lobe_cfg = self.lobes.get(self.active_lobe_idx)?;
+            let root = lobe_cfg.projects_root.as_ref()?;
+            discover_projects_for_lobe(root, &lobe_cfg.name)
+                .into_iter()
+                .next()
+                .map(|(_, p)| p)
+        });
+
+        match target {
+            None => {
+                self.push_log(&lobe, "⚠ select a project in the sidebar first".to_owned());
+            }
+            Some(path) => {
+                let subdir = match kind {
+                    PlanFileKind::Plan => "plans",
+                    PlanFileKind::Inquiry => "inquiries",
+                };
+                match create_work_file(&path, subdir, &title) {
+                    Ok(fp) => {
+                        let fname = fp.file_name().unwrap_or_default().to_string_lossy();
+                        self.push_log(&lobe, format!("✓ {subdir}: {fname}"));
+                    }
+                    Err(e) => {
+                        self.push_log(&lobe, format!("⚠ {subdir} error: {e}"));
+                    }
+                }
+            }
+        }
     }
 
     fn update_tasks(&mut self, lobe: &str, message: &str) {
@@ -852,6 +1023,31 @@ impl Tui {
 }
 
 
+fn create_work_file(project_path: &Path, subdir: &str, title: &str) -> anyhow::Result<std::path::PathBuf> {
+    let date_out = std::process::Command::new("date").arg("+%Y-%m-%d").output()?;
+    let date = String::from_utf8_lossy(&date_out.stdout).trim().to_owned();
+    let slug = {
+        let mut s = String::new();
+        let mut last_dash = true;
+        for c in title.chars() {
+            if c.is_alphanumeric() {
+                s.push(c.to_ascii_lowercase());
+                last_dash = false;
+            } else if !last_dash {
+                s.push('-');
+                last_dash = true;
+            }
+        }
+        let t = s.trim_end_matches('-').to_owned();
+        if t.is_empty() { subdir.to_owned() } else { t }
+    };
+    let dir = project_path.join(subdir);
+    std::fs::create_dir_all(&dir)?;
+    let file_path = dir.join(format!("{date}-{slug}.md"));
+    std::fs::write(&file_path, format!("# {title}\n\ndate: {date}\n\n---\n\n"))?;
+    Ok(file_path)
+}
+
 fn create_idea_file(vault_path: &Path, title: &str) -> anyhow::Result<std::path::PathBuf> {
     let date_out = std::process::Command::new("date").arg("+%Y-%m-%d").output()?;
     let date = String::from_utf8_lossy(&date_out.stdout).trim().to_owned();
@@ -883,7 +1079,9 @@ fn create_idea_file(vault_path: &Path, title: &str) -> anyhow::Result<std::path:
 
 fn next_section(section: Section) -> Section {
     match section {
-        Section::Agents => Section::Review,
+        Section::Agents => Section::Plans,
+        Section::Plans => Section::Inquiries,
+        Section::Inquiries => Section::Review,
         Section::Review => Section::Log,
         Section::Log => Section::Agents,
     }
@@ -892,7 +1090,9 @@ fn next_section(section: Section) -> Section {
 fn previous_section(section: Section) -> Section {
     match section {
         Section::Agents => Section::Log,
-        Section::Review => Section::Agents,
+        Section::Plans => Section::Agents,
+        Section::Inquiries => Section::Plans,
+        Section::Review => Section::Inquiries,
         Section::Log => Section::Review,
     }
 }
@@ -945,6 +1145,15 @@ fn discover_projects_for_lobe(root: &Path, lobe_name: &str) -> Vec<(String, std:
         .collect();
     projects.sort_by(|a, b| a.0.cmp(&b.0));
     projects
+}
+
+/// Returns the subset of known operational folder names that exist under `path`.
+fn discover_operational_folders(path: &Path) -> Vec<String> {
+    const KNOWN: &[&str] = &["ideas", "plans", "inquiries", "tasks", "todos"];
+    KNOWN.iter()
+        .filter(|&&name| path.join(name).is_dir())
+        .map(|&name| name.to_owned())
+        .collect()
 }
 
 /// Parses the `## Componentes` or `## Components` table in `<path>/index.md`.

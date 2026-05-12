@@ -9,14 +9,15 @@ use ratatui::{
 use super::theme;
 use super::widgets::KeybindingBar;
 use super::{
-    ApprovalKind, ApprovalRequest, Focus, ReviewItem, ReviewKind, ReviewStatus, Section,
-    TaskEntry, TaskKind,
+    ApprovalKind, ApprovalRequest, Focus, InputMode, PlanFileEntry, PlanFileKind, PlanFileState,
+    ReviewItem, ReviewKind, ReviewStatus, Section, TaskEntry, TaskKind,
 };
 
 #[derive(Debug, Clone)]
 pub struct SidebarProject {
     pub name: String,
     pub path: std::path::PathBuf,
+    pub folders: Vec<String>,    // plans, inquiries, ideas, tasks — exist on disk
     pub components: Vec<String>,
 }
 
@@ -40,13 +41,16 @@ pub fn main_screen(
     active_agent_count: usize,
     daemon_connected: bool,
     tasks: &[TaskEntry],
+    plan_files: &[PlanFileEntry],
+    inquiry_files: &[PlanFileEntry],
     reviews: &[ReviewItem],
     review_selected_idx: usize,
     logs: &[String],
-    log_scroll: u16,
+    log_selected_idx: usize,
     input_text: &str,
     active_lobe_name: &str,
     command_context: Option<&str>,
+    input_mode: InputMode,
     tick: u64,
 ) {
     let area = frame.area();
@@ -81,11 +85,17 @@ pub fn main_screen(
         Section::Agents => render_content_block(frame, right_rows[2], |frame, inner| {
             render_agents(frame, inner, tasks, tick);
         }),
+        Section::Plans => render_content_block(frame, right_rows[2], |frame, inner| {
+            render_work_files(frame, inner, plan_files, "No plan files found");
+        }),
+        Section::Inquiries => render_content_block(frame, right_rows[2], |frame, inner| {
+            render_work_files(frame, inner, inquiry_files, "No inquiry files found");
+        }),
         Section::Review => render_content_block(frame, right_rows[2], |frame, inner| {
             render_reviews(frame, inner, reviews, review_selected_idx);
         }),
         Section::Log => render_content_block(frame, right_rows[2], |frame, inner| {
-            render_log(frame, inner, logs, log_scroll);
+            render_log(frame, inner, logs, log_selected_idx);
         }),
     }
 
@@ -94,14 +104,14 @@ pub fn main_screen(
         Paragraph::new(sep).style(theme::style_border()),
         right_rows[3],
     );
-    render_input_bar(frame, right_rows[4], focus, input_text, command_context);
+    render_input_bar(frame, right_rows[4], focus, input_text, command_context, input_mode);
 
     let bindings: &[(&str, &str)] = if focus == Focus::Sidebar {
         &[("↑/↓", "nav"), ("enter", "ctx"), ("n", "idea"), ("←/→", "focus"), ("spc", "lobes"), ("q", "quit")]
     } else if active_section == Section::Review {
-        &[("↑/↓", "nav"), ("tab", "switch"), ("enter", "open"), ("a/r", "accept/reject"), ("i", "input"), ("q", "quit")]
+        &[("↑/↓", "nav"), ("tab", "section"), ("enter", "open"), ("a/r", "accept/reject"), ("i", "input"), ("q", "quit")]
     } else {
-        &[("↑/↓", "nav"), ("tab", "switch"), ("i", "input"), ("←", "sidebar"), ("spc", "lobes"), ("q", "quit")]
+        &[("↑/↓", "nav"), ("tab", "section"), ("i", "input"), ("←", "sidebar"), ("spc", "lobes"), ("q", "quit")]
     };
     KeybindingBar { bindings }.render(rows[1], frame.buffer_mut());
 }
@@ -112,16 +122,27 @@ fn render_header(
     active_lobe: &str,
     daemon_connected: bool,
 ) {
-    let spans = vec![
-        Span::styled("  cortex", theme::style_accent()),
-        Span::styled("  │  ", theme::style_dim()),
+    let conn_symbol = if daemon_connected { "●" } else { "○" };
+    let conn_style = if daemon_connected { theme::style_success() } else { theme::style_dim() };
+
+    let left = vec![
+        Span::styled("  ◆ ", theme::style_accent()),
+        Span::styled("cortex", theme::style_accent()),
+        Span::styled("  ╱  ", theme::style_border()),
         Span::styled(active_lobe.to_owned(), theme::style_accent2()),
-        Span::styled("  │  ", theme::style_dim()),
-        Span::styled(
-            if daemon_connected { "● connected" } else { "○ offline" },
-            if daemon_connected { theme::style_success() } else { theme::style_dim() },
-        ),
     ];
+    let right = vec![
+        Span::styled(conn_symbol, conn_style),
+        Span::styled("  ", theme::style_dim()),
+    ];
+
+    let left_width: usize = left.iter().map(|s| s.content.chars().count()).sum();
+    let right_width: usize = right.iter().map(|s| s.content.chars().count()).sum();
+    let pad = (area.width as usize).saturating_sub(left_width + right_width);
+
+    let mut spans = left;
+    spans.push(Span::styled(" ".repeat(pad), theme::style_normal()));
+    spans.extend(right);
 
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(theme::style_normal()),
@@ -152,67 +173,83 @@ fn render_sidebar(
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
+    let Some(item) = items.first() else { return; };
     let w = inner.width as usize;
     let is_focused = focus == Focus::Sidebar;
     let mut flat_items: Vec<ListItem> = Vec::new();
     let mut nav_rows: Vec<usize> = Vec::new();
 
-    for item in items {
-        // ── Lobe header (navigable) ─────────────────────────────
-        let lobe_nav_idx = nav_rows.len();
-        let is_lobe_sel = lobe_nav_idx == selected_idx;
-        let lobe_marker = if is_lobe_sel && is_focused { "●" } else if is_lobe_sel { "◦" } else { "▾" };
-        let lobe_style = if is_lobe_sel && is_focused {
-            theme::style_sidebar_selected()
-        } else if item.is_active {
-            theme::style_sidebar_header()
-        } else {
-            theme::style_sidebar_dim()
-        };
+    // ── Lobe header (navigable) ─────────────────────────────────
+    let is_lobe_sel = nav_rows.len() == selected_idx;
+    let lobe_marker = if is_lobe_sel && is_focused { "●" } else if is_lobe_sel { "◦" } else { "▾" };
+    let lobe_style = if is_lobe_sel && is_focused {
+        theme::style_sidebar_selected()
+    } else {
+        theme::style_sidebar_header()
+    };
+    nav_rows.push(flat_items.len());
+    flat_items.push(ListItem::new(Line::from(Span::styled(
+        format!(" {lobe_marker} {}", item.lobe),
+        lobe_style,
+    ))));
+
+    // ── Projects ────────────────────────────────────────────────
+    let project_count = item.projects.len();
+    for (proj_idx, project) in item.projects.iter().enumerate() {
+        let is_last_proj = proj_idx + 1 == project_count;
+        let has_children = !project.folders.is_empty() || !project.components.is_empty();
+
+        let is_proj_sel = nav_rows.len() == selected_idx;
+        let proj_marker = if is_proj_sel && is_focused { "●" } else if is_proj_sel { "◦" }
+            else if is_last_proj && !has_children { "╰" } else { "├" };
+        let proj_style = if is_proj_sel && is_focused { theme::style_sidebar_selected() }
+            else if is_proj_sel { theme::style_accent2() } else { theme::style_sidebar_item() };
+
         nav_rows.push(flat_items.len());
         flat_items.push(ListItem::new(Line::from(Span::styled(
-            format!(" {lobe_marker} {}", item.lobe),
-            lobe_style,
+            format!(" {proj_marker} {}", truncate_name(&project.name, w.saturating_sub(4))),
+            proj_style,
         ))));
 
-        // ── Projects ────────────────────────────────────────────
-        let project_count = item.projects.len();
-        for (proj_idx, project) in item.projects.iter().enumerate() {
-            let proj_nav_idx = nav_rows.len();
-            let is_sel = proj_nav_idx == selected_idx;
-            let is_last_proj = proj_idx + 1 == project_count;
+        // ── Operational folders ──────────────────────────────────
+        let folder_count = project.folders.len();
+        let comp_count = project.components.len();
+        let total_children = folder_count + comp_count;
 
-            let proj_marker = if is_sel && is_focused { "●" } else if is_sel { "◦" }
-                else if is_last_proj && project.components.is_empty() { "╰" } else { "├" };
-            let proj_style = if is_sel && is_focused { theme::style_sidebar_selected() }
-                else if is_sel { theme::style_accent2() } else { theme::style_sidebar_item() };
+        for (fi, folder) in project.folders.iter().enumerate() {
+            let child_pos = fi;
+            let is_last_child = is_last_proj && (child_pos + 1 == total_children);
+            let is_fol_sel = nav_rows.len() == selected_idx;
+            let fol_marker = if is_fol_sel && is_focused { "●" } else if is_fol_sel { "◦" }
+                else if is_last_child { "╰" } else { "├" };
+            let fol_style = if is_fol_sel && is_focused { theme::style_sidebar_selected() }
+                else if is_fol_sel { theme::style_accent2() } else { theme::style_sidebar_dim() };
 
-            let proj_name = truncate_name(&project.name, w.saturating_sub(4));
+            nav_rows.push(flat_items.len());
+            flat_items.push(ListItem::new(Line::from(vec![
+                Span::styled(format!("   {fol_marker} "), fol_style),
+                Span::styled(
+                    truncate_name(folder, w.saturating_sub(7)),
+                    fol_style,
+                ),
+            ])));
+        }
+
+        // ── Components ──────────────────────────────────────────
+        for (ci, comp) in project.components.iter().enumerate() {
+            let child_pos = folder_count + ci;
+            let is_last_child = is_last_proj && (child_pos + 1 == total_children);
+            let is_comp_sel = nav_rows.len() == selected_idx;
+            let comp_marker = if is_comp_sel && is_focused { "●" } else if is_comp_sel { "◦" }
+                else if is_last_child { "╰" } else { "├" };
+            let comp_style = if is_comp_sel && is_focused { theme::style_sidebar_selected() }
+                else if is_comp_sel { theme::style_accent2() } else { theme::style_sidebar_dim() };
+
             nav_rows.push(flat_items.len());
             flat_items.push(ListItem::new(Line::from(Span::styled(
-                format!(" {proj_marker} {proj_name}"),
-                proj_style,
+                format!("   {comp_marker} {}", truncate_name(comp, w.saturating_sub(6))),
+                comp_style,
             ))));
-
-            // ── Components ──────────────────────────────────────
-            let comp_count = project.components.len();
-            for (comp_idx, comp) in project.components.iter().enumerate() {
-                let comp_nav_idx = nav_rows.len();
-                let is_comp_sel = comp_nav_idx == selected_idx;
-                let is_last_in_tree = is_last_proj && (comp_idx + 1 == comp_count);
-
-                let comp_marker = if is_comp_sel && is_focused { "●" } else if is_comp_sel { "◦" }
-                    else if is_last_in_tree { "╰" } else { "├" };
-                let comp_style = if is_comp_sel && is_focused { theme::style_sidebar_selected() }
-                    else if is_comp_sel { theme::style_accent2() } else { theme::style_sidebar_dim() };
-
-                let comp_name = truncate_name(comp, w.saturating_sub(6));
-                nav_rows.push(flat_items.len());
-                flat_items.push(ListItem::new(Line::from(Span::styled(
-                    format!("   {comp_marker} {comp_name}"),
-                    comp_style,
-                ))));
-            }
         }
     }
 
@@ -223,10 +260,11 @@ fn render_sidebar(
 
     let mut tree_state = ListState::default();
     tree_state.select(highlight_row);
-    let tree_list = List::new(flat_items)
-        .style(theme::style_sidebar_bg())
-        .highlight_style(theme::style_sidebar_selected());
-    frame.render_stateful_widget(tree_list, sections[0], &mut tree_state);
+    frame.render_stateful_widget(
+        List::new(flat_items).style(theme::style_sidebar_bg()).highlight_style(theme::style_sidebar_selected()),
+        sections[0],
+        &mut tree_state,
+    );
 
     // Status footer
     let footer = if running_count > 0 {
@@ -236,10 +274,7 @@ fn render_sidebar(
             Span::styled(format!("{running_count} running · {active_lobe_name}"), theme::style_orange()),
         ])
     } else {
-        Line::from(Span::styled(
-            format!("  ○  idle · {active_lobe_name}"),
-            theme::style_sidebar_dim(),
-        ))
+        Line::from(Span::styled(format!("  ○  idle · {active_lobe_name}"), theme::style_sidebar_dim()))
     };
     frame.render_widget(Paragraph::new(footer), sections[1]);
 }
@@ -275,6 +310,8 @@ fn push_section_spans(
             label: "Agents".to_owned(),
             badge: if active_agent_count > 0 { Some(active_agent_count.to_string()) } else { None },
         },
+        Tab { section: Section::Plans, label: "Plans".to_owned(), badge: None },
+        Tab { section: Section::Inquiries, label: "Inquiries".to_owned(), badge: None },
         Tab {
             section: Section::Review,
             label: "Review".to_owned(),
@@ -318,37 +355,48 @@ fn render_input_bar(
     focus: Focus,
     input_text: &str,
     command_context: Option<&str>,
+    input_mode: InputMode,
 ) {
     let focused = focus == Focus::Input;
-    let border_style = if focused {
-        theme::style_border_accent()
+    let border_style = if focused { theme::style_border_accent() } else { theme::style_border() };
+
+    let mode_style = if focused {
+        match input_mode {
+            InputMode::Command => theme::style_accent2(),
+            InputMode::NewPlan => theme::style_orange(),
+            InputMode::NewInquiry => theme::style_accent(),
+        }
     } else {
-        theme::style_border()
+        theme::style_dim()
     };
 
-    // Title shows context if set
-    let title = if let Some(ctx) = command_context {
-        Line::from(vec![
-            Span::styled(" Message ", if focused { theme::style_accent() } else { theme::style_input_idle() }),
-            Span::styled(format!("[{ctx}] "), theme::style_accent2()),
-        ])
-    } else {
-        Line::from(Span::styled(
-            " Message ",
-            if focused { theme::style_accent() } else { theme::style_input_idle() },
-        ))
+    let mut title_spans = vec![Span::styled(
+        format!(" {} ", input_mode.label()),
+        mode_style,
+    )];
+    if let Some(ctx) = command_context {
+        title_spans.push(Span::styled("╱ ", theme::style_border()));
+        title_spans.push(Span::styled(ctx.to_owned(), theme::style_accent2()));
+        title_spans.push(Span::styled(" ", theme::style_dim()));
+    }
+
+    let action_hint = match input_mode {
+        InputMode::Command => "send",
+        InputMode::NewPlan => "create plan",
+        InputMode::NewInquiry => "create inquiry",
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(theme::BORDER)
         .border_style(border_style)
-        .title(title)
+        .title(Line::from(title_spans))
         .title_bottom(
             Line::from(vec![
-                Span::styled(" ←: ctx", theme::style_dim()),
+                Span::styled(" tab: mode", theme::style_dim()),
+                Span::styled("  ←: ctx", theme::style_dim()),
                 Span::styled("  esc: back", theme::style_dim()),
-                Span::styled("  enter: send ", theme::style_dim()),
+                Span::styled(format!("  enter: {action_hint} "), theme::style_dim()),
             ])
             .right_aligned(),
         )
@@ -357,21 +405,27 @@ fn render_input_bar(
     frame.render_widget(block, area);
 
     let line = if focused {
-        Line::from(vec![
-            Span::styled(" > ", theme::style_accent()),
-            Span::styled(input_text.to_owned(), theme::style_input_focused()),
-            Span::styled("_", theme::style_cursor()),
-        ])
+        let placeholder = match input_mode {
+            InputMode::Command => "type a message...",
+            InputMode::NewPlan => "plan title...",
+            InputMode::NewInquiry => "inquiry title...",
+        };
+        if input_text.is_empty() {
+            Line::from(vec![
+                Span::styled(" > ", theme::style_accent()),
+                Span::styled(placeholder, theme::style_dim()),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled(" > ", theme::style_accent()),
+                Span::styled(input_text.to_owned(), theme::style_input_focused()),
+                Span::styled("_", theme::style_cursor()),
+            ])
+        }
     } else if input_text.is_empty() {
-        Line::from(Span::styled(
-            "  i · type a message...",
-            theme::style_input_idle(),
-        ))
+        Line::from(Span::styled("  i · type a message...", theme::style_input_idle()))
     } else {
-        Line::from(Span::styled(
-            format!("  {input_text}"),
-            theme::style_input_idle(),
-        ))
+        Line::from(Span::styled(format!("  {input_text}"), theme::style_input_idle()))
     };
 
     frame.render_widget(Paragraph::new(line).style(theme::style_normal()), inner);
@@ -418,19 +472,48 @@ fn render_reviews(frame: &mut Frame, area: Rect, reviews: &[ReviewItem], selecte
     render_list(frame, area, items, selected_idx);
 }
 
-fn render_log(frame: &mut Frame, area: Rect, logs: &[String], scroll: u16) {
+fn render_work_files(frame: &mut Frame, area: Rect, entries: &[PlanFileEntry], empty_msg: &str) {
+    if entries.is_empty() {
+        render_empty(frame, area, empty_msg);
+        return;
+    }
+
+    let items: Vec<ListItem> = entries
+        .iter()
+        .map(|entry| {
+            let (dot, dot_style) = match entry.state {
+                PlanFileState::Active => ("⠿", theme::style_accent()),
+                PlanFileState::Completed => ("●", theme::style_success()),
+                PlanFileState::Pending => ("○", theme::style_dim()),
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("  {dot}  "), dot_style),
+                Span::styled(entry.project.as_str(), theme::style_dim()),
+                Span::styled("  ", theme::style_dim()),
+                Span::styled(entry.filename.as_str(), theme::style_normal()),
+            ]))
+        })
+        .collect();
+
+    frame.render_widget(List::new(items).style(theme::style_normal()), area);
+}
+
+fn render_log(frame: &mut Frame, area: Rect, logs: &[String], selected_idx: usize) {
     if logs.is_empty() {
         render_empty(frame, area, "No log entries");
         return;
     }
 
-    let lines: Vec<Line> = logs.iter().map(|line| log_line(line)).collect();
-    let paragraph = Paragraph::new(Text::from(lines))
-        .style(theme::style_normal())
-        .scroll((scroll, 0))
-        .wrap(Wrap { trim: false });
+    let items: Vec<ListItem> = logs.iter().map(|line| ListItem::new(log_line(line))).collect();
+    let clamped = selected_idx.min(items.len().saturating_sub(1));
+    let mut state = ListState::default();
+    state.select(Some(clamped));
 
-    frame.render_widget(paragraph, area);
+    let list = List::new(items)
+        .style(theme::style_normal())
+        .highlight_style(theme::style_selected());
+
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn render_list(frame: &mut Frame, area: Rect, items: Vec<ListItem>, selected_idx: usize) {
