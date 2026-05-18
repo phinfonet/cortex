@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub monitor: MonitorConfig,
     pub lobes: Vec<Lobe>,
@@ -10,15 +10,21 @@ pub struct Config {
     pub agents_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MonitorConfig {
     pub socket_path: PathBuf,
     #[serde(default = "default_ui_socket_path")]
     pub ui_socket_path: PathBuf,
+    #[serde(default = "default_mcp_socket_path")]
+    pub mcp_socket_path: PathBuf,
 }
 
 fn default_ui_socket_path() -> PathBuf {
     PathBuf::from("/tmp/cortex-ui.sock")
+}
+
+fn default_mcp_socket_path() -> PathBuf {
+    PathBuf::from("/tmp/cortex-mcp.sock")
 }
 
 #[derive(Debug, Deserialize, Clone)]

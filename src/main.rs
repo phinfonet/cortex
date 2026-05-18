@@ -26,6 +26,7 @@ struct Cli {
 enum Command {
     Daemon,
     Tui,
+    Mcp,
     Event { payload: String },
 }
 
@@ -36,8 +37,14 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Daemon => run_daemon().await,
         Command::Tui => run_tui().await,
+        Command::Mcp => run_mcp().await,
         Command::Event { payload } => run_event(payload).await,
     }
+}
+
+async fn run_mcp() -> anyhow::Result<()> {
+    let config = config::load()?;
+    mcp::run_stdio(config).await
 }
 
 async fn run_daemon() -> anyhow::Result<()> {
@@ -56,11 +63,19 @@ async fn run_daemon() -> anyhow::Result<()> {
         let _ = ui_server.run().await;
     });
 
+    let mcp_config = config.clone();
+    let mcp_router_tx = router_tx.clone();
+    let mcp_server_task = tokio::spawn(async move {
+        let _ = mcp::run_daemon(mcp_config, mcp_router_tx).await;
+    });
+
     let monitor = monitor::Monitor::new(config.lobes.clone(), config.monitor.socket_path.clone());
     let mut event_rx = monitor.run().await?;
 
-    let router = router::Router::new(config.lobes.clone(), router_tx.clone())
-        .with_global_agents_dir(config.agents_dir.clone());
+    let router = std::sync::Arc::new(
+        router::Router::new(config.lobes.clone(), router_tx.clone())
+            .with_global_agents_dir(config.agents_dir.clone()),
+    );
 
     tokio::spawn(async move {
         loop {
@@ -76,7 +91,14 @@ async fn run_daemon() -> anyhow::Result<()> {
             if let Some(data) = dto {
                 let _ = broadcast_tx.send(DaemonMessage::Event { data });
             }
-            let _ = router.handle(event).await;
+            // FileChanged events have no router handler — skip spawn to avoid noise.
+            let needs_routing = !matches!(event, monitor::AppEvent::FileChanged { .. });
+            if needs_routing {
+                let router = std::sync::Arc::clone(&router);
+                tokio::spawn(async move {
+                    let _ = router.handle(event).await;
+                });
+            }
         }
     });
 
@@ -94,6 +116,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     }
 
     ui_server_task.abort();
+    mcp_server_task.abort();
 
     Ok(())
 }

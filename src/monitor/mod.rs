@@ -2,7 +2,7 @@ mod event;
 mod socket;
 mod watcher;
 
-pub use event::AppEvent;
+pub use event::{AppEvent, PlanMeta};
 pub use socket::SocketReceiver;
 pub use watcher::FileWatcher;
 

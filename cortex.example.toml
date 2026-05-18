@@ -1,6 +1,7 @@
 [monitor]
 socket_path = "/tmp/cortex.sock"
 ui_socket_path = "/tmp/cortex-ui.sock"
+mcp_socket_path = "/tmp/cortex-mcp.sock"
 
 # Optional: global agents directory (fallback when lobe has no agents_dir)
 # agents_dir = "~/.config/cortex/agents"

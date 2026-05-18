@@ -28,29 +28,41 @@ impl FileWatcher {
             }
         }
 
-        for result in notify_rx {
-            match result {
-                Ok(event) => {
-                    let is_relevant =
-                        matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_));
+        let lobes = self.lobes;
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let _watcher = watcher;
+            for result in notify_rx {
+                match result {
+                    Ok(event) => {
+                        let is_relevant =
+                            matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_));
 
-                    if !is_relevant {
-                        continue;
-                    }
+                        if !is_relevant {
+                            continue;
+                        }
 
-                    for path in event.paths {
-                        let lobe_name = self.lobe_for_path(&path);
-                        let app_event = build_event(lobe_name, &path).await;
-                        if tx.send(app_event).await.is_err() {
-                            return Ok(());
+                        for path in event.paths {
+                            let lobe_name = lobes
+                                .iter()
+                                .find(|l| path.starts_with(&l.path))
+                                .map(|l| l.name.clone())
+                                .unwrap_or_default();
+                            let tx = tx.clone();
+                            let path_clone = path.clone();
+                            let handle = handle.clone();
+                            handle.spawn(async move {
+                                let app_event = build_event(lobe_name, &path_clone).await;
+                                let _ = tx.send(app_event).await;
+                            });
                         }
                     }
-                }
-                Err(err) => {
-                    eprintln!("file watcher error: {err}");
+                    Err(err) => {
+                        eprintln!("file watcher error: {err}");
+                    }
                 }
             }
-        }
+        });
 
         Ok(())
     }
@@ -74,22 +86,42 @@ async fn build_event(lobe: String, path: &Path) -> AppEvent {
         }
     }
     if is_plan_file(path) {
-        return AppEvent::PlanDetected {
-            lobe: lobe.clone(),
-            plan: PlanMeta {
-                filename: path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default(),
-                path: path.to_string_lossy().to_string(),
-                project: lobe,
-            },
-        };
+        // Only trigger if status is ready/absent — skip if already in_progress, done, etc.
+        let status = read_plan_status(path).await;
+        let should_trigger = matches!(status.as_deref(), None | Some("") | Some("ready"));
+        if should_trigger {
+            return AppEvent::PlanDetected {
+                lobe: lobe.clone(),
+                plan: PlanMeta {
+                    filename: path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                    path: path.to_string_lossy().to_string(),
+                    project: lobe,
+                },
+            };
+        }
     }
     AppEvent::FileChanged {
         lobe,
         path: path.to_string_lossy().into_owned(),
     }
+}
+
+/// Reads the `status:` field from a plan file's frontmatter. Returns None if absent or unreadable.
+async fn read_plan_status(path: &Path) -> Option<String> {
+    let content = tokio::fs::read_to_string(path).await.ok()?;
+    let content = content.trim_start();
+    let after_open = content.strip_prefix("---")?;
+    let close_pos = after_open.find("\n---")?;
+    let frontmatter = &after_open[..close_pos];
+    frontmatter.lines().find_map(|line| {
+        let line = line.trim();
+        let value = line.strip_prefix("status:")?.trim();
+        let value = value.trim_matches(['"', '\'']);
+        Some(value.to_string())
+    })
 }
 
 fn is_inquiry_file(path: &Path) -> bool {

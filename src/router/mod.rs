@@ -1,9 +1,12 @@
 pub mod classifier;
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
+use tokio::time::timeout;
 
 use crate::config::Lobe;
 use crate::monitor::AppEvent;
@@ -15,6 +18,8 @@ pub struct Router {
     lobes: Vec<Lobe>,
     tx: mpsc::Sender<AppEvent>,
     global_agents_dir: Option<PathBuf>,
+    /// Limits concurrent AI subprocess calls (claude/codex) to 1 to prevent RAM spikes.
+    ai_sem: Arc<Semaphore>,
 }
 
 impl Router {
@@ -23,6 +28,7 @@ impl Router {
             lobes,
             tx,
             global_agents_dir: None,
+            ai_sem: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -62,15 +68,9 @@ impl Router {
                             let output_name = &inquiry.output;
                             let output_full = path.join("docs").join(format!("{}.md", output_name));
 
-                            let _ = Command::new("obsidian")
-                                .args([
-                                    "create",
-                                    &format!("name={}", output_name),
-                                    &format!("content={}", doc_content),
-                                    "silent",
-                                ])
-                                .output()
-                                .await;
+                            let docs_dir = path.join("docs");
+                            let _ = tokio::fs::create_dir_all(&docs_dir).await;
+                            let _ = tokio::fs::write(&output_full, &doc_content).await;
 
                             if let Some(ref path) = lobe_path {
                                 let rel_path =
@@ -121,13 +121,17 @@ impl Router {
                         })
                         .await;
 
+                    // Mark plan as in_progress to prevent re-trigger
+                    let _ = set_plan_status(&plan.path, "in_progress").await;
+
                     let lobe_agents_dir = self
                         .lobes
                         .iter()
                         .find(|l| l.name == lobe)
                         .map(|l| l.agents_dir());
 
-                    let result = async {
+                    let _permit = self.ai_sem.acquire().await;
+                    let run_result = async {
                         let plan_content = tokio::fs::read_to_string(&plan.path).await?;
                         let prompt = if let Some(ref agent_name) = agent {
                             let agent_content = resolve_agent(
@@ -144,12 +148,25 @@ impl Router {
                             plan_content
                         };
                         CodexSupplier.run(&prompt).await
-                    }
-                    .await;
+                    };
+
+                    let result = timeout(Duration::from_secs(600), run_result).await;
 
                     match result {
-                        Ok(output) => {
+                        Err(_elapsed) => {
+                            let _ = set_plan_status(&plan.path, "failed").await;
+                            let _ = self
+                                .tx
+                                .send(AppEvent::PlanFailed {
+                                    lobe,
+                                    filename: plan.filename,
+                                    reason: "timeout after 10 minutes".to_owned(),
+                                })
+                                .await;
+                        }
+                        Ok(Ok(output)) => {
                             let summary = output.chars().take(500).collect();
+                            let _ = set_plan_status(&plan.path, "done").await;
                             let _ = self
                                 .tx
                                 .send(AppEvent::PlanCompleted {
@@ -160,7 +177,8 @@ impl Router {
                                 })
                                 .await;
                         }
-                        Err(err) => {
+                        Ok(Err(err)) => {
+                            let _ = set_plan_status(&plan.path, "failed").await;
                             let _ = self
                                 .tx
                                 .send(AppEvent::PlanFailed {
@@ -193,9 +211,17 @@ impl Router {
                     })
                     .await;
 
+                // Mark plan as in_progress to prevent re-trigger during execution
+                let _ = set_plan_status(&plan.path, "in_progress").await;
+
                 let lobe_agents_dir_opt = lobe_config.map(|l| l.agents_dir());
                 let agent_content = if let Some(ref name) = agent {
-                    resolve_agent(name, lobe_agents_dir_opt.as_ref(), self.global_agents_dir.as_ref()).await
+                    resolve_agent(
+                        name,
+                        lobe_agents_dir_opt.as_ref(),
+                        self.global_agents_dir.as_ref(),
+                    )
+                    .await
                 } else {
                     None
                 };
@@ -225,8 +251,9 @@ impl Router {
                     None => format!("{} {}", agent_mention, workflow),
                 };
 
+                let _permit = self.ai_sem.acquire().await;
                 let code_dir_str = code_dir.to_string_lossy().to_string();
-                let subprocess_result = Command::new("claude")
+                let subprocess_future = Command::new("claude")
                     .args([
                         "-p",
                         &prompt,
@@ -236,11 +263,24 @@ impl Router {
                         &code_dir_str,
                         "--dangerously-skip-permissions",
                     ])
-                    .output()
-                    .await;
+                    .output();
+
+                let subprocess_result = timeout(Duration::from_secs(600), subprocess_future).await;
 
                 match subprocess_result {
-                    Err(err) => {
+                    Err(_elapsed) => {
+                        let _ = set_plan_status(&plan.path, "failed").await;
+                        let _ = self
+                            .tx
+                            .send(AppEvent::PlanFailed {
+                                lobe,
+                                filename: plan.filename,
+                                reason: "timeout after 10 minutes".to_owned(),
+                            })
+                            .await;
+                    }
+                    Ok(Err(err)) => {
+                        let _ = set_plan_status(&plan.path, "failed").await;
                         let _ = self
                             .tx
                             .send(AppEvent::PlanFailed {
@@ -250,13 +290,14 @@ impl Router {
                             })
                             .await;
                     }
-                    Ok(output) => {
+                    Ok(Ok(output)) => {
                         let stdout = String::from_utf8_lossy(&output.stdout);
                         let stderr = String::from_utf8_lossy(&output.stderr);
 
                         if output.status.success() {
                             let diff = capture_diff(&code_dir).await;
                             let summary = stdout.chars().take(500).collect();
+                            let _ = set_plan_status(&plan.path, "done").await;
                             let _ = self
                                 .tx
                                 .send(AppEvent::PlanCompleted {
@@ -272,6 +313,7 @@ impl Router {
                             } else {
                                 stderr.chars().take(200).collect()
                             };
+                            let _ = set_plan_status(&plan.path, "failed").await;
                             let _ = self
                                 .tx
                                 .send(AppEvent::PlanFailed {
@@ -303,6 +345,7 @@ impl Router {
                     return Ok(());
                 }
 
+                let _permit = self.ai_sem.acquire().await;
                 let result = if use_codex {
                     let lobe_agents_dir = self
                         .lobes
@@ -320,15 +363,27 @@ impl Router {
                         Some(content) => format!("{}\n\n---\n\n{}", content, body),
                         None => body.to_owned(),
                     };
-                    CodexSupplier.run(&prompt).await
+                    timeout(Duration::from_secs(600), CodexSupplier.run(&prompt))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("timeout after 10 minutes"))
+                        .and_then(|r| r)
                 } else {
                     let claude_lobe = self.lobes.iter().find(|l| l.name == lobe);
                     let claude_agents_dir = claude_lobe.map(|l| l.agents_dir());
                     let claude_code_dir: PathBuf = claude_lobe
-                        .and_then(|l| l.projects_root.as_ref()).cloned()
+                        .and_then(|l| l.projects_root.as_ref())
+                        .cloned()
                         .or_else(|| claude_lobe.map(|l| l.path.clone()))
-                        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Stuff"));
-                    let prompt = match resolve_agent(&agent_name, claude_agents_dir.as_ref(), self.global_agents_dir.as_ref()).await {
+                        .unwrap_or_else(|| {
+                            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Stuff")
+                        });
+                    let prompt = match resolve_agent(
+                        &agent_name,
+                        claude_agents_dir.as_ref(),
+                        self.global_agents_dir.as_ref(),
+                    )
+                    .await
+                    {
                         Some(content) => format!("{}\n\n---\n\n{}", content, body),
                         None => format!("@{agent_name} {body}"),
                     };
@@ -360,7 +415,9 @@ async fn capture_diff(dir: &std::path::Path) -> Option<String> {
         return Some(diff);
     }
     // Walk immediate subdirs
-    let Ok(entries) = std::fs::read_dir(dir) else { return None; };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return None;
+    };
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.is_dir() {
@@ -379,13 +436,19 @@ async fn git_diff_in(dir: &std::path::Path) -> Option<String> {
         .output()
         .await
         .ok()?;
-    if !out.status.success() { return None; }
+    if !out.status.success() {
+        return None;
+    }
     let text = String::from_utf8_lossy(&out.stdout).to_string();
-    if text.trim().is_empty() { None } else { Some(text) }
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 async fn run_claude_command(prompt: &str, code_dir: &std::path::Path) -> anyhow::Result<String> {
-    let output = Command::new("claude")
+    let future = Command::new("claude")
         .args([
             "-p",
             prompt,
@@ -395,8 +458,11 @@ async fn run_claude_command(prompt: &str, code_dir: &std::path::Path) -> anyhow:
             &code_dir.to_string_lossy().to_string(),
             "--dangerously-skip-permissions",
         ])
-        .output()
-        .await?;
+        .output();
+
+    let output = timeout(Duration::from_secs(600), future)
+        .await
+        .map_err(|_| anyhow::anyhow!("timeout after 10 minutes"))??;
 
     if !output.status.success() {
         anyhow::bail!(
@@ -440,26 +506,50 @@ fn extract_agent_and_body(text: &str) -> (Option<String>, &str) {
     (Some(agent), body)
 }
 
-async fn set_inquiry_status(path: &str, status: &str) -> anyhow::Result<()> {
-    let output = Command::new("obsidian")
-        .args([
-            "property:set",
-            "name=status",
-            &format!("value={}", status),
-            &format!("path={}", path),
-            "silent",
-        ])
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "obsidian property:set failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
+async fn set_plan_status(path: &str, status: &str) -> anyhow::Result<()> {
+    let content = tokio::fs::read_to_string(path).await?;
+    let updated = update_frontmatter_field(&content, "status", status);
+    tokio::fs::write(path, updated).await?;
     Ok(())
+}
+
+async fn set_inquiry_status(path: &str, status: &str) -> anyhow::Result<()> {
+    let content = tokio::fs::read_to_string(path).await?;
+    let updated = update_frontmatter_field(&content, "status", status);
+    tokio::fs::write(path, updated).await?;
+    Ok(())
+}
+
+fn update_frontmatter_field(content: &str, field: &str, value: &str) -> String {
+    let content = content.trim_start();
+    let Some(after_open) = content.strip_prefix("---\n") else {
+        return format!("---\n{field}: {value}\n---\n\n{content}");
+    };
+    let Some(close_pos) = after_open.find("\n---") else {
+        return format!("---\n{field}: {value}\n---\n\n{content}");
+    };
+    let frontmatter = &after_open[..close_pos];
+    let rest = &after_open[close_pos + 4..];
+    let field_prefix = format!("{field}:");
+    let new_fm = if frontmatter
+        .lines()
+        .any(|l| l.trim_start().starts_with(&field_prefix))
+    {
+        frontmatter
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with(&field_prefix) {
+                    format!("{field}: {value}")
+                } else {
+                    l.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        format!("{frontmatter}\n{field}: {value}")
+    };
+    format!("---\n{new_fm}\n---{rest}")
 }
 
 async fn read_plan_supplier(path: &str) -> Option<String> {

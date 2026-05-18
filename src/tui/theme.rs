@@ -11,6 +11,8 @@ pub const FG_DIM: Color = Color::Rgb(98, 114, 164); // #6272a4
 pub const ACCENT: Color = Color::Rgb(189, 147, 249); // #bd93f9 purple
 pub const ACCENT2: Color = Color::Rgb(139, 233, 253); // #8be9fd cyan
 pub const GREEN: Color = Color::Rgb(80, 250, 123); // #50fa7b
+pub const TEAL: Color = Color::Rgb(0, 220, 170);
+pub const BLUE: Color = Color::Rgb(110, 130, 250);
 pub const YELLOW: Color = Color::Rgb(241, 250, 140); // #f1fa8c
 pub const ORANGE: Color = Color::Rgb(255, 184, 108); // #ffb86c
 pub const RED: Color = Color::Rgb(255, 85, 85); // #ff5555
@@ -55,6 +57,14 @@ pub fn style_selected() -> Style {
 
 pub fn style_success() -> Style {
     Style::default().fg(GREEN).bg(BG)
+}
+
+pub fn style_teal() -> Style {
+    Style::default().fg(TEAL).bg(BG)
+}
+
+pub fn style_blue() -> Style {
+    Style::default().fg(BLUE).bg(BG)
 }
 
 pub fn style_warning() -> Style {
